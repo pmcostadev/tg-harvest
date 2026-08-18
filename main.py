@@ -1,4 +1,4 @@
-import os, asyncio, random, string
+import os, asyncio, random, string, time
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from telethon.errors import (
@@ -9,7 +9,7 @@ from telethon.tl.functions.channels import GetParticipantsRequest
 from telethon.tl.types import ChannelParticipantsSearch
 from psycopg_pool import AsyncConnectionPool
 
-VERSION = "v4"
+VERSION = "v5"
 
 API_ID = int(os.environ["TG_API_ID"])
 API_HASH = os.environ["TG_API_HASH"]
@@ -24,13 +24,15 @@ JITTER = float(os.getenv("JITTER", "4"))
 
 INVITE_LINK = os.getenv("INVITE_LINK", "")
 INVITE_TEXT = os.getenv("INVITE_TEXT", "")
+# Batch size per cycle. In loop mode this is "per hour".
 INVITE_DAILY_CAP = int(os.getenv("INVITE_DAILY_CAP", "15"))
 INVITE_DELAY = float(os.getenv("INVITE_DELAY", "180"))
 INVITE_JITTER = float(os.getenv("INVITE_JITTER", "120"))
 ACTIVES_ONLY = os.getenv("ACTIVES_ONLY", "false").lower() == "true"
-# Only DM people harvested from this group. Keeps messages honest when the
-# database holds members from several groups.
 INVITE_SCOPE_GROUP = os.getenv("INVITE_SCOPE_GROUP", "true").lower() == "true"
+# Keep cycling until the list is exhausted instead of stopping after one batch.
+INVITE_LOOP = os.getenv("INVITE_LOOP", "false").lower() == "true"
+INVITE_CYCLE = float(os.getenv("INVITE_CYCLE", "3600"))  # seconds per cycle
 
 client = TelegramClient(StringSession(SESSION), API_ID, API_HASH)
 pool = None
@@ -51,9 +53,6 @@ CREATE TABLE IF NOT EXISTS outreach (
   sent_at TIMESTAMPTZ DEFAULT now()
 );
 """
-
-# Backfill: everything already in the table came from the first group.
-BACKFILL = "UPDATE members SET group_name = %s WHERE group_name IS NULL"
 
 INSERT = """
 INSERT INTO members (user_id, username, first_name, last_name, is_bot, source, group_name)
@@ -140,21 +139,15 @@ async def scrape():
 
 # ---------------------------------------------------------------- invite
 
-async def invite():
-    if not INVITE_TEXT:
-        print("ERROR: set INVITE_TEXT first", flush=True)
-        return await idle()
-
-    filters = []
-    params = []
+async def fetch_queue(limit):
+    filters, params = [], []
     if INVITE_SCOPE_GROUP:
         filters.append("AND m.group_name = %s")
         params.append(GROUP)
     if ACTIVES_ONLY:
         filters.append("AND m.source = 'listen'")
     extra = " ".join(filters)
-    params.append(INVITE_DAILY_CAP)
-
+    params.append(limit)
     async with pool.connection() as con:
         cur = await con.execute(
             f"""
@@ -171,18 +164,17 @@ async def invite():
             """,
             tuple(params),
         )
-        queue = await cur.fetchall()
+        return await cur.fetchall()
+
+
+async def sent_total():
+    async with pool.connection() as con:
         cur = await con.execute("SELECT count(*) FROM outreach WHERE status = 'sent'")
-        already = (await cur.fetchone())[0]
+        return (await cur.fetchone())[0]
 
-    if not queue:
-        print("nothing left to contact", flush=True)
-        return await idle()
 
-    scope = GROUP if INVITE_SCOPE_GROUP else "ALL GROUPS"
-    print(f"[{VERSION}] queue: {len(queue)} from {scope} | sent all-time: {already} "
-          f"| ~{INVITE_DELAY}-{INVITE_DELAY + INVITE_JITTER}s apart", flush=True)
-
+async def send_batch(queue):
+    """Returns (sent, skipped, halted)."""
     sent = skipped = 0
     for user_id, username, first_name, _rank in queue:
         body = (INVITE_TEXT
@@ -196,9 +188,9 @@ async def invite():
             print(f"sent -> @{username} ({sent}/{len(queue)})", flush=True)
         except PeerFloodError:
             await mark(user_id, "aborted", "PeerFloodError")
-            print("!! PeerFloodError: Telegram flagged this as spam. STOPPING.", flush=True)
-            print("!! Wait 24-48h before trying again.", flush=True)
-            break
+            print("!! PeerFloodError: Telegram flagged this as spam. HALTING.", flush=True)
+            print("!! Set MODE=listen and leave the account alone for 24-48h.", flush=True)
+            return sent, skipped, True
         except FloodWaitError as e:
             print(f"[floodwait] {e.seconds}s", flush=True)
             await asyncio.sleep(e.seconds + 10)
@@ -223,9 +215,48 @@ async def invite():
             await mark(user_id, "error", str(e))
             print(f"error -> @{username}: {type(e).__name__}: {e}", flush=True)
         await nap(INVITE_DELAY, INVITE_JITTER)
+    return sent, skipped, False
 
-    print(f"RUN DONE: {sent} sent, {skipped} skipped", flush=True)
-    await idle()
+
+async def invite():
+    if not INVITE_TEXT:
+        print("ERROR: set INVITE_TEXT first", flush=True)
+        return await idle()
+
+    scope = GROUP if INVITE_SCOPE_GROUP else "ALL GROUPS"
+    cycle = 0
+
+    while True:
+        cycle += 1
+        started = time.monotonic()
+        queue = await fetch_queue(INVITE_DAILY_CAP)
+
+        if not queue:
+            print(f"[{VERSION}] nothing left to contact in {scope}. "
+                  f"total sent all-time: {await sent_total()}", flush=True)
+            return await idle()
+
+        print(f"[{VERSION}] cycle {cycle} | batch of {len(queue)} from {scope} "
+              f"| sent all-time: {await sent_total()} "
+              f"| ~{INVITE_DELAY}-{INVITE_DELAY + INVITE_JITTER}s apart", flush=True)
+
+        sent, skipped, halted = await send_batch(queue)
+        print(f"cycle {cycle} done: {sent} sent, {skipped} skipped "
+              f"| all-time sent: {await sent_total()}", flush=True)
+
+        if halted:
+            return await idle()
+        if not INVITE_LOOP:
+            print("loop disabled, stopping after one batch", flush=True)
+            return await idle()
+
+        # Wait out the rest of the cycle window before the next batch.
+        elapsed = time.monotonic() - started
+        rest = max(0.0, INVITE_CYCLE - elapsed)
+        if rest:
+            mins = int(rest // 60)
+            print(f"sleeping {mins}m until next cycle", flush=True)
+            await asyncio.sleep(rest)
 
 
 # ---------------------------------------------------------------- listen
@@ -251,8 +282,6 @@ async def main():
     await pool.open()
     async with pool.connection() as con:
         await con.execute(SCHEMA)
-        # Tag pre-v4 rows with the first group they came from.
-        await con.execute(BACKFILL, (os.getenv("BACKFILL_GROUP", GROUP),))
     await client.start()
     if MODE == "scrape":
         await scrape()

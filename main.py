@@ -9,7 +9,7 @@ from telethon.tl.functions.channels import GetParticipantsRequest
 from telethon.tl.types import ChannelParticipantsSearch
 from psycopg_pool import AsyncConnectionPool
 
-VERSION = "v3"
+VERSION = "v4"
 
 API_ID = int(os.environ["TG_API_ID"])
 API_HASH = os.environ["TG_API_HASH"]
@@ -28,6 +28,9 @@ INVITE_DAILY_CAP = int(os.getenv("INVITE_DAILY_CAP", "15"))
 INVITE_DELAY = float(os.getenv("INVITE_DELAY", "180"))
 INVITE_JITTER = float(os.getenv("INVITE_JITTER", "120"))
 ACTIVES_ONLY = os.getenv("ACTIVES_ONLY", "false").lower() == "true"
+# Only DM people harvested from this group. Keeps messages honest when the
+# database holds members from several groups.
+INVITE_SCOPE_GROUP = os.getenv("INVITE_SCOPE_GROUP", "true").lower() == "true"
 
 client = TelegramClient(StringSession(SESSION), API_ID, API_HASH)
 pool = None
@@ -39,6 +42,8 @@ CREATE TABLE IF NOT EXISTS members (
   is_bot BOOLEAN, source TEXT,
   seen_at TIMESTAMPTZ DEFAULT now()
 );
+ALTER TABLE members ADD COLUMN IF NOT EXISTS group_name TEXT;
+CREATE INDEX IF NOT EXISTS members_group_idx ON members (group_name);
 CREATE TABLE IF NOT EXISTS outreach (
   user_id BIGINT PRIMARY KEY,
   status TEXT,
@@ -47,16 +52,19 @@ CREATE TABLE IF NOT EXISTS outreach (
 );
 """
 
+# Backfill: everything already in the table came from the first group.
+BACKFILL = "UPDATE members SET group_name = %s WHERE group_name IS NULL"
+
 INSERT = """
-INSERT INTO members (user_id, username, first_name, last_name, is_bot, source)
-VALUES (%s, %s, %s, %s, %s, %s)
+INSERT INTO members (user_id, username, first_name, last_name, is_bot, source, group_name)
+VALUES (%s, %s, %s, %s, %s, %s, %s)
 ON CONFLICT (user_id) DO UPDATE SET username = EXCLUDED.username
 """
 
 
 async def save(users, source):
     rows = [(u.id, u.username, u.first_name, u.last_name,
-             bool(getattr(u, "bot", False)), source) for u in users]
+             bool(getattr(u, "bot", False)), source, GROUP) for u in users]
     async with pool.connection() as con:
         async with con.cursor() as cur:
             await cur.executemany(INSERT, rows)
@@ -74,7 +82,8 @@ async def mark(user_id, status, detail=""):
 
 async def count_saved():
     async with pool.connection() as con:
-        cur = await con.execute("SELECT count(*) FROM members")
+        cur = await con.execute(
+            "SELECT count(*) FROM members WHERE group_name = %s", (GROUP,))
         return (await cur.fetchone())[0]
 
 
@@ -124,7 +133,8 @@ async def scrape():
         for q in string.ascii_lowercase + string.digits:
             got = await page_through(ch, q, seen)
             print(f"prefix '{q}': +{got} (total {len(seen)})", flush=True)
-    print(f"DONE: {len(seen)} unique members, {await count_saved()} rows in db", flush=True)
+    print(f"DONE: {len(seen)} unique from {GROUP}, "
+          f"{await count_saved()} rows tagged to this group", flush=True)
     await idle()
 
 
@@ -135,7 +145,15 @@ async def invite():
         print("ERROR: set INVITE_TEXT first", flush=True)
         return await idle()
 
-    where_active = "AND m.source = 'listen'" if ACTIVES_ONLY else ""
+    filters = []
+    params = []
+    if INVITE_SCOPE_GROUP:
+        filters.append("AND m.group_name = %s")
+        params.append(GROUP)
+    if ACTIVES_ONLY:
+        filters.append("AND m.source = 'listen'")
+    extra = " ".join(filters)
+    params.append(INVITE_DAILY_CAP)
 
     async with pool.connection() as con:
         cur = await con.execute(
@@ -147,11 +165,11 @@ async def invite():
             WHERE m.is_bot = false
               AND m.username IS NOT NULL
               AND o.user_id IS NULL
-              {where_active}
+              {extra}
             ORDER BY rank, m.seen_at DESC
             LIMIT %s
             """,
-            (INVITE_DAILY_CAP,),
+            tuple(params),
         )
         queue = await cur.fetchall()
         cur = await con.execute("SELECT count(*) FROM outreach WHERE status = 'sent'")
@@ -161,7 +179,8 @@ async def invite():
         print("nothing left to contact", flush=True)
         return await idle()
 
-    print(f"[{VERSION}] queue: {len(queue)} | already sent all-time: {already} "
+    scope = GROUP if INVITE_SCOPE_GROUP else "ALL GROUPS"
+    print(f"[{VERSION}] queue: {len(queue)} from {scope} | sent all-time: {already} "
           f"| ~{INVITE_DELAY}-{INVITE_DELAY + INVITE_JITTER}s apart", flush=True)
 
     sent = skipped = 0
@@ -170,8 +189,6 @@ async def invite():
                 .replace("{name}", (first_name or "").strip())
                 .replace("{link}", INVITE_LINK))
         try:
-            # Pass the @username string directly: Telethon resolves it server-side,
-            # which works even with a cold session cache.
             await client.send_message(f"@{username}", body,
                                       link_preview=bool(INVITE_LINK))
             await mark(user_id, "sent")
@@ -223,17 +240,19 @@ async def listen():
             await save([s], "listen")
             print(f"+ {s.id} @{s.username}", flush=True)
 
-    print("listening...", flush=True)
+    print(f"listening on {GROUP}...", flush=True)
     await client.run_until_disconnected()
 
 
 async def main():
     global pool
-    print(f"=== tg-harvest {VERSION} starting | MODE={MODE} ===", flush=True)
+    print(f"=== tg-harvest {VERSION} starting | MODE={MODE} | GROUP={GROUP} ===", flush=True)
     pool = AsyncConnectionPool(DB_URL, min_size=1, max_size=3, open=False)
     await pool.open()
     async with pool.connection() as con:
         await con.execute(SCHEMA)
+        # Tag pre-v4 rows with the first group they came from.
+        await con.execute(BACKFILL, (os.getenv("BACKFILL_GROUP", GROUP),))
     await client.start()
     if MODE == "scrape":
         await scrape()

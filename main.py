@@ -22,7 +22,7 @@ DELAY = float(os.getenv("DELAY", "8"))
 JITTER = float(os.getenv("JITTER", "4"))
 
 # invite pacing
-INVITE_LINK = os.getenv("INVITE_LINK", "")          # optional
+INVITE_LINK = os.getenv("INVITE_LINK", "")
 INVITE_TEXT = os.getenv("INVITE_TEXT", "")
 INVITE_DAILY_CAP = int(os.getenv("INVITE_DAILY_CAP", "15"))
 INVITE_DELAY = float(os.getenv("INVITE_DELAY", "180"))
@@ -142,6 +142,16 @@ async def invite():
         print("ERROR: set INVITE_TEXT first", flush=True)
         return await idle()
 
+    # A fresh StringSession has no entity cache, so PeerUser(id) lookups fail.
+    # Touching the group first teaches the session who these people are.
+    try:
+        ch = await client.get_entity(GROUP)
+        async for _ in client.iter_participants(ch, limit=200):
+            pass
+        print("entity cache warmed", flush=True)
+    except Exception as e:
+        print(f"warmup skipped: {e}", flush=True)
+
     where_active = "AND m.source = 'listen'" if ACTIVES_ONLY else ""
 
     async with pool.connection() as con:
@@ -178,14 +188,16 @@ async def invite():
                 .replace("{name}", (first_name or "").strip())
                 .replace("{link}", INVITE_LINK))
         try:
-            await client.send_message(user_id, body, link_preview=bool(INVITE_LINK))
+            # Resolve by @username: works without a warm entity cache.
+            target = await client.get_entity(username)
+            await client.send_message(target, body, link_preview=bool(INVITE_LINK))
             await mark(user_id, "sent")
             sent += 1
             print(f"sent -> @{username} ({sent}/{len(queue)})", flush=True)
         except PeerFloodError:
             await mark(user_id, "aborted", "PeerFloodError")
             print("!! PeerFloodError: Telegram flagged this as spam. STOPPING.", flush=True)
-            print("!! Wait 24-48h. If it happens again, the message text is the problem.", flush=True)
+            print("!! Wait 24-48h. If it repeats, the message text is the problem.", flush=True)
             break
         except FloodWaitError as e:
             print(f"[floodwait] {e.seconds}s", flush=True)
@@ -201,6 +213,11 @@ async def invite():
         except (UserIdInvalidError, InputUserDeactivatedError):
             await mark(user_id, "skipped", "dead account")
             skipped += 1
+        except ValueError as e:
+            # username no longer resolvable (changed or deleted)
+            await mark(user_id, "skipped", f"unresolvable: {e}")
+            skipped += 1
+            print(f"skip -> @{username} (cannot resolve)", flush=True)
         except Exception as e:
             await mark(user_id, "error", str(e))
             print(f"error -> @{username}: {e}", flush=True)

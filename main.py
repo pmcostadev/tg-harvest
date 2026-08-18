@@ -9,6 +9,8 @@ from telethon.tl.functions.channels import GetParticipantsRequest
 from telethon.tl.types import ChannelParticipantsSearch
 from psycopg_pool import AsyncConnectionPool
 
+VERSION = "v3"
+
 API_ID = int(os.environ["TG_API_ID"])
 API_HASH = os.environ["TG_API_HASH"]
 SESSION = os.environ["TG_SESSION"]
@@ -16,12 +18,10 @@ GROUP = os.environ["TG_GROUP"]
 MODE = os.getenv("MODE", "listen")
 DB_URL = os.environ["DATABASE_URL"]
 
-# scrape pacing
 PAGE = int(os.getenv("PAGE_SIZE", "100"))
 DELAY = float(os.getenv("DELAY", "8"))
 JITTER = float(os.getenv("JITTER", "4"))
 
-# invite pacing
 INVITE_LINK = os.getenv("INVITE_LINK", "")
 INVITE_TEXT = os.getenv("INVITE_TEXT", "")
 INVITE_DAILY_CAP = int(os.getenv("INVITE_DAILY_CAP", "15"))
@@ -117,40 +117,23 @@ async def scrape():
     ch = await client.get_entity(GROUP)
     total_members = getattr(ch, "participants_count", None)
     print(f"target: {GROUP} | reported members: {total_members}", flush=True)
-    print(f"pacing: {PAGE}/request, ~{DELAY}-{DELAY + JITTER}s between requests", flush=True)
-
     seen = set()
     await page_through(ch, "", seen)
     print(f"plain pass done: {len(seen)} unique", flush=True)
-
     if total_members and len(seen) < total_members * 0.9:
-        print("gap detected, running prefix passes", flush=True)
         for q in string.ascii_lowercase + string.digits:
             got = await page_through(ch, q, seen)
             print(f"prefix '{q}': +{got} (total {len(seen)})", flush=True)
-
     print(f"DONE: {len(seen)} unique members, {await count_saved()} rows in db", flush=True)
-    print("switch MODE back to listen when you are ready", flush=True)
     await idle()
 
 
 # ---------------------------------------------------------------- invite
 
 async def invite():
-    """Paced one-time migration DM. Each person decides for themselves."""
     if not INVITE_TEXT:
         print("ERROR: set INVITE_TEXT first", flush=True)
         return await idle()
-
-    # A fresh StringSession has no entity cache, so PeerUser(id) lookups fail.
-    # Touching the group first teaches the session who these people are.
-    try:
-        ch = await client.get_entity(GROUP)
-        async for _ in client.iter_participants(ch, limit=200):
-            pass
-        print("entity cache warmed", flush=True)
-    except Exception as e:
-        print(f"warmup skipped: {e}", flush=True)
 
     where_active = "AND m.source = 'listen'" if ACTIVES_ONLY else ""
 
@@ -171,7 +154,6 @@ async def invite():
             (INVITE_DAILY_CAP,),
         )
         queue = await cur.fetchall()
-
         cur = await con.execute("SELECT count(*) FROM outreach WHERE status = 'sent'")
         already = (await cur.fetchone())[0]
 
@@ -179,7 +161,7 @@ async def invite():
         print("nothing left to contact", flush=True)
         return await idle()
 
-    print(f"queue: {len(queue)} | already sent all-time: {already} "
+    print(f"[{VERSION}] queue: {len(queue)} | already sent all-time: {already} "
           f"| ~{INVITE_DELAY}-{INVITE_DELAY + INVITE_JITTER}s apart", flush=True)
 
     sent = skipped = 0
@@ -188,16 +170,17 @@ async def invite():
                 .replace("{name}", (first_name or "").strip())
                 .replace("{link}", INVITE_LINK))
         try:
-            # Resolve by @username: works without a warm entity cache.
-            target = await client.get_entity(username)
-            await client.send_message(target, body, link_preview=bool(INVITE_LINK))
+            # Pass the @username string directly: Telethon resolves it server-side,
+            # which works even with a cold session cache.
+            await client.send_message(f"@{username}", body,
+                                      link_preview=bool(INVITE_LINK))
             await mark(user_id, "sent")
             sent += 1
             print(f"sent -> @{username} ({sent}/{len(queue)})", flush=True)
         except PeerFloodError:
             await mark(user_id, "aborted", "PeerFloodError")
             print("!! PeerFloodError: Telegram flagged this as spam. STOPPING.", flush=True)
-            print("!! Wait 24-48h. If it repeats, the message text is the problem.", flush=True)
+            print("!! Wait 24-48h before trying again.", flush=True)
             break
         except FloodWaitError as e:
             print(f"[floodwait] {e.seconds}s", flush=True)
@@ -210,21 +193,21 @@ async def invite():
         except UserIsBlockedError:
             await mark(user_id, "skipped", "blocked")
             skipped += 1
+            print(f"skip -> @{username} (blocked)", flush=True)
         except (UserIdInvalidError, InputUserDeactivatedError):
             await mark(user_id, "skipped", "dead account")
             skipped += 1
+            print(f"skip -> @{username} (dead)", flush=True)
         except ValueError as e:
-            # username no longer resolvable (changed or deleted)
             await mark(user_id, "skipped", f"unresolvable: {e}")
             skipped += 1
             print(f"skip -> @{username} (cannot resolve)", flush=True)
         except Exception as e:
             await mark(user_id, "error", str(e))
-            print(f"error -> @{username}: {e}", flush=True)
+            print(f"error -> @{username}: {type(e).__name__}: {e}", flush=True)
         await nap(INVITE_DELAY, INVITE_JITTER)
 
     print(f"RUN DONE: {sent} sent, {skipped} skipped", flush=True)
-    print("restart the service tomorrow for the next batch, or set MODE=listen", flush=True)
     await idle()
 
 
@@ -246,6 +229,7 @@ async def listen():
 
 async def main():
     global pool
+    print(f"=== tg-harvest {VERSION} starting | MODE={MODE} ===", flush=True)
     pool = AsyncConnectionPool(DB_URL, min_size=1, max_size=3, open=False)
     await pool.open()
     async with pool.connection() as con:

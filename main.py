@@ -4,7 +4,7 @@ from telethon.sessions import StringSession
 from telethon.errors import FloodWaitError
 from telethon.tl.functions.channels import GetParticipantsRequest
 from telethon.tl.types import ChannelParticipantsSearch
-import asyncpg
+from psycopg_pool import AsyncConnectionPool
 
 API_ID = int(os.environ["TG_API_ID"])
 API_HASH = os.environ["TG_API_HASH"]
@@ -25,19 +25,19 @@ CREATE TABLE IF NOT EXISTS members (
 );
 """
 
+INSERT = """
+INSERT INTO members (user_id, username, first_name, last_name, is_bot, source)
+VALUES (%s, %s, %s, %s, %s, %s)
+ON CONFLICT (user_id) DO UPDATE SET username = EXCLUDED.username
+"""
+
 
 async def save(users, source):
     rows = [(u.id, u.username, u.first_name, u.last_name,
              bool(getattr(u, "bot", False)), source) for u in users]
-    async with pool.acquire() as con:
-        await con.executemany(
-            """
-            INSERT INTO members (user_id, username, first_name, last_name, is_bot, source)
-            VALUES ($1,$2,$3,$4,$5,$6)
-            ON CONFLICT (user_id) DO UPDATE SET username = EXCLUDED.username
-            """,
-            rows,
-        )
+    async with pool.connection() as con:
+        async with con.cursor() as cur:
+            await cur.executemany(INSERT, rows)
 
 
 async def scrape():
@@ -83,8 +83,9 @@ async def listen():
 
 async def main():
     global pool
-    pool = await asyncpg.create_pool(DB_URL)
-    async with pool.acquire() as con:
+    pool = AsyncConnectionPool(DB_URL, min_size=1, max_size=3, open=False)
+    await pool.open()
+    async with pool.connection() as con:
         await con.execute(SCHEMA)
     await client.start()
     await (scrape() if MODE == "scrape" else listen())

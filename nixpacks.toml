@@ -1,2 +1,1 @@
-[start]
-cmd = "python main.py"
+# Not used: this project builds from the Dockerfile.

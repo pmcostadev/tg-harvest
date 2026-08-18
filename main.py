@@ -22,11 +22,12 @@ DELAY = float(os.getenv("DELAY", "8"))
 JITTER = float(os.getenv("JITTER", "4"))
 
 # invite pacing
-INVITE_LINK = os.getenv("INVITE_LINK", "")
+INVITE_LINK = os.getenv("INVITE_LINK", "")          # optional
 INVITE_TEXT = os.getenv("INVITE_TEXT", "")
-INVITE_DAILY_CAP = int(os.getenv("INVITE_DAILY_CAP", "25"))
-INVITE_DELAY = float(os.getenv("INVITE_DELAY", "90"))
-INVITE_JITTER = float(os.getenv("INVITE_JITTER", "60"))
+INVITE_DAILY_CAP = int(os.getenv("INVITE_DAILY_CAP", "15"))
+INVITE_DELAY = float(os.getenv("INVITE_DELAY", "180"))
+INVITE_JITTER = float(os.getenv("INVITE_JITTER", "120"))
+ACTIVES_ONLY = os.getenv("ACTIVES_ONLY", "false").lower() == "true"
 
 client = TelegramClient(StringSession(SESSION), API_ID, API_HASH)
 pool = None
@@ -83,6 +84,11 @@ async def nap(base=None, jit=None):
     await asyncio.sleep(base + random.random() * jit)
 
 
+async def idle():
+    while True:
+        await asyncio.sleep(3600)
+
+
 # ---------------------------------------------------------------- scrape
 
 async def page_through(ch, query, seen):
@@ -131,18 +137,16 @@ async def scrape():
 # ---------------------------------------------------------------- invite
 
 async def invite():
-    """One-time migration DM. Each person decides for themselves whether to join."""
-    if not INVITE_LINK or not INVITE_TEXT:
-        print("ERROR: set INVITE_LINK and INVITE_TEXT first", flush=True)
-        return await idle()
-    if "{link}" not in INVITE_TEXT:
-        print("ERROR: INVITE_TEXT must contain {link}", flush=True)
+    """Paced one-time migration DM. Each person decides for themselves."""
+    if not INVITE_TEXT:
+        print("ERROR: set INVITE_TEXT first", flush=True)
         return await idle()
 
-    # Actives first: people who actually talk are the ones worth moving.
+    where_active = "AND m.source = 'listen'" if ACTIVES_ONLY else ""
+
     async with pool.connection() as con:
         cur = await con.execute(
-            """
+            f"""
             SELECT m.user_id, m.username, m.first_name,
                    CASE WHEN m.source = 'listen' THEN 0 ELSE 1 END AS rank
             FROM members m
@@ -150,6 +154,7 @@ async def invite():
             WHERE m.is_bot = false
               AND m.username IS NOT NULL
               AND o.user_id IS NULL
+              {where_active}
             ORDER BY rank, m.seen_at DESC
             LIMIT %s
             """,
@@ -157,26 +162,30 @@ async def invite():
         )
         queue = await cur.fetchall()
 
+        cur = await con.execute("SELECT count(*) FROM outreach WHERE status = 'sent'")
+        already = (await cur.fetchone())[0]
+
     if not queue:
-        print("nothing left to contact today", flush=True)
+        print("nothing left to contact", flush=True)
         return await idle()
 
-    print(f"queue: {len(queue)} people | cap {INVITE_DAILY_CAP}/run "
+    print(f"queue: {len(queue)} | already sent all-time: {already} "
           f"| ~{INVITE_DELAY}-{INVITE_DELAY + INVITE_JITTER}s apart", flush=True)
 
     sent = skipped = 0
     for user_id, username, first_name, _rank in queue:
-        body = INVITE_TEXT.replace("{name}", first_name or "").replace("{link}", INVITE_LINK)
+        body = (INVITE_TEXT
+                .replace("{name}", (first_name or "").strip())
+                .replace("{link}", INVITE_LINK))
         try:
-            await client.send_message(user_id, body, link_preview=True)
+            await client.send_message(user_id, body, link_preview=bool(INVITE_LINK))
             await mark(user_id, "sent")
             sent += 1
             print(f"sent -> @{username} ({sent}/{len(queue)})", flush=True)
         except PeerFloodError:
-            # Telegram's explicit spam warning. Stop, do not push through it.
             await mark(user_id, "aborted", "PeerFloodError")
-            print("!! PeerFloodError: Telegram flagged this as spam. Stopping.", flush=True)
-            print("!! Wait at least 24-48h. If it repeats, the message itself is the problem.", flush=True)
+            print("!! PeerFloodError: Telegram flagged this as spam. STOPPING.", flush=True)
+            print("!! Wait 24-48h. If it happens again, the message text is the problem.", flush=True)
             break
         except FloodWaitError as e:
             print(f"[floodwait] {e.seconds}s", flush=True)
@@ -185,6 +194,7 @@ async def invite():
         except UserPrivacyRestrictedError:
             await mark(user_id, "skipped", "privacy settings")
             skipped += 1
+            print(f"skip -> @{username} (privacy)", flush=True)
         except UserIsBlockedError:
             await mark(user_id, "skipped", "blocked")
             skipped += 1
@@ -197,7 +207,7 @@ async def invite():
         await nap(INVITE_DELAY, INVITE_JITTER)
 
     print(f"RUN DONE: {sent} sent, {skipped} skipped", flush=True)
-    print("redeploy tomorrow for the next batch, or set MODE=listen", flush=True)
+    print("restart the service tomorrow for the next batch, or set MODE=listen", flush=True)
     await idle()
 
 
@@ -215,11 +225,6 @@ async def listen():
 
     print("listening...", flush=True)
     await client.run_until_disconnected()
-
-
-async def idle():
-    while True:
-        await asyncio.sleep(3600)
 
 
 async def main():

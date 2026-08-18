@@ -1,4 +1,4 @@
-import os, asyncio, string
+import os, asyncio, random, string
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from telethon.errors import FloodWaitError
@@ -12,6 +12,11 @@ SESSION = os.environ["TG_SESSION"]
 GROUP = os.environ["TG_GROUP"]
 MODE = os.getenv("MODE", "listen")
 DB_URL = os.environ["DATABASE_URL"]
+
+# Tuning knobs for scrape mode.
+PAGE = int(os.getenv("PAGE_SIZE", "100"))        # members per request (max 200)
+DELAY = float(os.getenv("DELAY", "8"))           # base seconds between requests
+JITTER = float(os.getenv("JITTER", "4"))         # random extra 0..JITTER seconds
 
 client = TelegramClient(StringSession(SESSION), API_ID, API_HASH)
 pool = None
@@ -40,31 +45,63 @@ async def save(users, source):
             await cur.executemany(INSERT, rows)
 
 
+async def count_saved():
+    async with pool.connection() as con:
+        cur = await con.execute("SELECT count(*) FROM members")
+        row = await cur.fetchone()
+        return row[0]
+
+
+async def nap():
+    await asyncio.sleep(DELAY + random.random() * JITTER)
+
+
+async def page_through(ch, query, seen):
+    """Walk one search query to exhaustion. Returns how many new users it found."""
+    offset, found = 0, 0
+    while True:
+        try:
+            res = await client(GetParticipantsRequest(
+                ch, ChannelParticipantsSearch(query), offset, PAGE, hash=0))
+        except FloodWaitError as e:
+            print(f"[floodwait] sleeping {e.seconds}s", flush=True)
+            await asyncio.sleep(e.seconds + 10)
+            continue
+        if not res.users:
+            return found
+        fresh = [u for u in res.users if u.id not in seen]
+        seen.update(u.id for u in fresh)
+        if fresh:
+            await save(fresh, f"scrape:{query or '_'}")
+        found += len(fresh)
+        offset += len(res.users)
+        label = query or "(all)"
+        print(f"[{label}] offset={offset} new={found} total={len(seen)}", flush=True)
+        await nap()
+
+
 async def scrape():
     ch = await client.get_entity(GROUP)
-    seen, total = set(), 0
-    # empty query first, then a-z / 0-9 prefixes: each gets its own ~10k budget
-    for q in [""] + list(string.ascii_lowercase + string.digits):
-        offset = 0
-        while True:
-            try:
-                res = await client(GetParticipantsRequest(
-                    ch, ChannelParticipantsSearch(q), offset, 200, hash=0))
-            except FloodWaitError as e:
-                print(f"floodwait {e.seconds}s", flush=True)
-                await asyncio.sleep(e.seconds + 5)
-                continue
-            if not res.users:
-                break
-            fresh = [u for u in res.users if u.id not in seen]
-            seen.update(u.id for u in fresh)
-            if fresh:
-                await save(fresh, f"scrape:{q or '_'}")
-            total += len(fresh)
-            offset += len(res.users)
-            print(f"q='{q}' offset={offset} unique={total}", flush=True)
-            await asyncio.sleep(2)
-    print(f"done: {total} unique members", flush=True)
+    total_members = getattr(ch, "participants_count", None)
+    print(f"target: {GROUP} | reported members: {total_members}", flush=True)
+    print(f"pacing: {PAGE}/request, ~{DELAY}-{DELAY + JITTER}s between requests", flush=True)
+
+    seen = set()
+    await page_through(ch, "", seen)
+    print(f"plain pass done: {len(seen)} unique", flush=True)
+
+    # Only bother with the alphabet trick if the plain pass clearly hit a wall.
+    if total_members and len(seen) < total_members * 0.9:
+        print("gap detected, running prefix passes", flush=True)
+        for q in string.ascii_lowercase + string.digits:
+            got = await page_through(ch, q, seen)
+            print(f"prefix '{q}': +{got} (total {len(seen)})", flush=True)
+
+    print(f"DONE: {len(seen)} unique members, {await count_saved()} rows in db", flush=True)
+    print("switch MODE back to listen when you are ready", flush=True)
+    # Idle instead of exiting, so Railway does not restart-loop the scrape.
+    while True:
+        await asyncio.sleep(3600)
 
 
 async def listen():
